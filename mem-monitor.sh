@@ -27,6 +27,14 @@ set -u
 LOG="${1:-$(dirname "$0")/mem-monitor.log}"
 INTERVAL_SECS=300  # 5 minutes — tune down to 60 for faster capture
 
+# Heap-snapshot trigger config — auto-capture when pi RSS exceeds threshold.
+PI_HEAP_THRESHOLD_MB="${PI_HEAP_THRESHOLD_MB:-1500}"
+HEAP_COOLDOWN_SECS="${HEAP_COOLDOWN_SECS:-3600}"
+HEAP_DIR="$(dirname "$0")/heap-snapshots"
+HEAP_STATE_FILE="$HEAP_DIR/.triggered.state"
+mkdir -p "$HEAP_DIR"
+touch "$HEAP_STATE_FILE"
+
 # ── helpers ──────────────────────────────────────────────────────────────────
 
 banner() {
@@ -263,6 +271,128 @@ while true; do
     section "SWAP TREND MARKERS"
     sysctl vm.swapusage 2>/dev/null || true
     printf "Pageouts (cumulative): %s\n" "$(vm_stat | awk '/Pageouts/ {gsub(/\./,"",$NF); print $NF}')"
+
+    # ╭───────────────────────────────────────────────╮
+    # │ 10. Heap-snapshot trigger (pi over threshold)│
+    # ╰────────────────────────────────────────────────╯
+    section "HEAP SNAPSHOT TRIGGER (threshold: ${PI_HEAP_THRESHOLD_MB} MB)"
+    # Find every `pi` process and its RSS.
+    pi_candidates=$(ps -eo pid,rss,comm,args \
+      | awk '($3 == "pi") || ($4 ~ /\/pi$|\/pi /) { print $1" "$2 }')
+    if [[ -z "$pi_candidates" ]]; then
+      printf "(no pi process found)\n"
+    else
+      now=$(date +%s)
+      printf "%-8s %10s  %s\n" "PID" "RSS(MB)" "ACTION"
+      while read -r pi_pid pi_rss_kb; do
+        [[ -z "$pi_pid" ]] && continue
+        pi_rss_mb=$(awk -v k="$pi_rss_kb" 'BEGIN{printf "%.0f", k/1024}')
+        if (( pi_rss_mb < PI_HEAP_THRESHOLD_MB )); then
+          printf "%-8s %10s  under threshold\n" "$pi_pid" "$pi_rss_mb"
+          continue
+        fi
+
+        last=$(awk -v p="$pi_pid" '$1==p {print $2}' "$HEAP_STATE_FILE" | tail -1)
+        last=${last:-0}
+        age=$(( now - last ))
+        if (( age < HEAP_COOLDOWN_SECS )); then
+          printf "%-8s %10s  over threshold, cooling down (%ss ago)\n" \
+            "$pi_pid" "$pi_rss_mb" "$age"
+          continue
+        fi
+
+        ts=$(date '+%Y%m%d-%H%M%S')
+        prefix="$HEAP_DIR/pi-${pi_pid}-${ts}"
+        printf "%-8s %10s  TRIGGERING SNAPSHOT → %s.*\n" \
+          "$pi_pid" "$pi_rss_mb" "$prefix"
+
+        # a) Context: cmdline + parent chain
+        {
+          echo "# pi heap-snapshot trigger"
+          echo "timestamp: $(date)"
+          echo "pid: $pi_pid"
+          echo "rss_mb: $pi_rss_mb"
+          echo "threshold_mb: $PI_HEAP_THRESHOLD_MB"
+          echo
+          echo "## cmdline"
+          ps -p "$pi_pid" -o args= 2>/dev/null || echo "(gone)"
+          echo
+          echo "## parent chain"
+          cp=$pi_pid
+          for _ in 1 2 3 4 5; do
+            line=$(ps -p "$cp" -o pid,ppid,comm,args 2>/dev/null | tail -1)
+            [[ -z "$line" ]] && break
+            echo "  $line"
+            cp=$(echo "$line" | awk '{print $2}')
+            [[ "$cp" == "1" || "$cp" == "0" ]] && break
+          done
+        } > "${prefix}.context.txt" 2>&1
+
+        # b) vmmap summary (macOS region breakdown — JS heap vs native)
+        if command -v vmmap &>/dev/null; then
+          if vmmap -summary "$pi_pid" > "${prefix}.vmmap-summary.txt" 2>&1; then
+            echo "         saved ${prefix}.vmmap-summary.txt"
+          else
+            echo "         vmmap failed (may need 'Developer Tools' permission)"
+          fi
+        fi
+
+        # c) lsof — captures loaded .node addons and open JS files
+        if lsof -p "$pi_pid" > "${prefix}.lsof.txt" 2>&1; then
+          echo "         saved ${prefix}.lsof.txt"
+        fi
+
+        # d) SIGUSR1 → Node opens its inspector port
+        if kill -SIGUSR1 "$pi_pid" 2>/dev/null; then
+          echo "         sent SIGUSR1 — Node inspector should now be listening"
+          # Wait a beat, then try to capture the listening port
+          sleep 1
+          lsof -p "$pi_pid" -iTCP -sTCP:LISTEN -Pn 2>/dev/null \
+            > "${prefix}.inspector-port.txt" || true
+        else
+          echo "         kill -SIGUSR1 failed (process gone?)"
+        fi
+
+        # e) README with instructions
+        base="${prefix##*/}"
+        cat > "${prefix}.README.md" <<EOF
+# pi heap snapshot — $(date)
+
+pi (PID $pi_pid) RSS was ${pi_rss_mb} MB (threshold ${PI_HEAP_THRESHOLD_MB} MB).
+
+## Files
+- \`${base}.context.txt\` — cmdline + parent chain
+- \`${base}.vmmap-summary.txt\` — macOS region breakdown (native vs JS heap)
+- \`${base}.lsof.txt\` — open files, native addons, pipes
+- \`${base}.inspector-port.txt\` — TCP port Node is listening on
+
+## Capture the JS heap snapshot
+Node was signalled (SIGUSR1) to open its inspector.
+
+1. Check \`${base}.inspector-port.txt\` — it'll show something like \`127.0.0.1:9229\`.
+2. Open Chrome → \`chrome://inspect\` → Configure → add that host:port.
+3. Under "Remote Target" click **inspect**.
+4. DevTools → **Memory** → **Heap snapshot** → **Take snapshot**.
+5. Save the \`.heapsnapshot\` file next to this README.
+6. Sort by **Retained Size**; retainer paths under \`~/.pi/extensions/\` or
+   \`~/.pi/agent/extensions/\` identify the leaking extension.
+
+## Quick identify without DevTools
+\`\`\`bash
+grep -E '\.pi/(agent/)?extensions/' ${base}.lsof.txt
+\`\`\`
+
+Shows every extension file pi has open — the leaker is usually the one
+with the most open handles or the most \`.node\` native addons loaded.
+EOF
+
+        # f) Record trigger time in state file
+        tmp=$(mktemp)
+        awk -v p="$pi_pid" '$1 != p' "$HEAP_STATE_FILE" > "$tmp"
+        echo "$pi_pid $now" >> "$tmp"
+        mv "$tmp" "$HEAP_STATE_FILE"
+      done <<< "$pi_candidates"
+    fi
 
   } 2>&1 | tee -a "$LOG"
 
