@@ -128,10 +128,13 @@ while true; do
     # ╰──────────────────────────────────────────────╯
     section "TOP 30 PROCESSES BY RSS"
     printf "%-8s %-8s %10s %6s  %s\n" "PID" "PPID" "RSS(MB)" "%MEM" "COMMAND"
-    ps -eo pid,ppid,rss,pmem,comm -r \
-      | head -31 \
-      | tail -30 \
-      | awk '{ rss_mb = $3/1024; printf "%-8s %-8s %10.1f %6s  %s\n", $1, $2, rss_mb, $4, $5 }'
+    # Use `args` (full cmdline) instead of `comm` (truncated). Sort by RSS desc.
+    ps -eo pid,ppid,rss,pmem,args \
+      | awk 'NR>1 { cmd=""; for (i=5;i<=NF;i++) cmd=cmd" "$i;
+                    printf "%s\t%s\t%s\t%s\t%s\n", $1, $2, $3, $4, cmd }' \
+      | sort -k3 -rn \
+      | head -30 \
+      | awk -F'\t' '{ rss_mb=$3/1024; printf "%-8s %-8s %10.1f %6s  %s\n", $1, $2, rss_mb, $4, $5 }'
 
     # ╭──────────────────────────────────────────────╮
     # │ 3. All VS Code / Electron processes          │
@@ -188,7 +191,15 @@ while true; do
     # ╰──────────────────────────────────────────────╯
     section "VS CODE STATUS (code --status)"
     if command -v code &>/dev/null; then
-      timeout 15 code --status 2>&1 || printf "(code --status timed out or failed)\n"
+      # macOS has no `timeout`; run in background and kill after N seconds.
+      (
+        code --status 2>&1 &
+        cpid=$!
+        ( sleep 15; kill -9 "$cpid" 2>/dev/null ) &
+        watcher=$!
+        wait "$cpid" 2>/dev/null
+        kill "$watcher" 2>/dev/null
+      ) || printf "(code --status failed)\n"
     else
       printf "('code' not in PATH)\n"
     fi
@@ -196,14 +207,43 @@ while true; do
     # ╭──────────────────────────────────────────────╮
     # │ 7. Process tree snapshot (pstree style)      │
     # ╰──────────────────────────────────────────────╯
-    section "PROCESS TREE (Code descendants)"
-    if command -v pstree &>/dev/null; then
-      for cpid in $(pgrep -if 'Code Helper.app' | head -3); do
-        printf "── tree for PID %s ──\n" "$cpid"
-        pstree "$cpid" 2>/dev/null || true
-      done
+    section "PROCESS TREE (Code descendants, built from ps)"
+    # pstree is blocked by Santa at Shopify — build our own tree from ps.
+    # Find top-level Code processes (ppid is launchd or not-a-Code-process),
+    # then recursively print children with indentation.
+    # Space-separated (awk -v can't handle embedded newlines).
+    code_roots=$(ps -eo pid,ppid,comm \
+      | awk '/[Cc]ode|Electron/ && !/grep/ { print $1 }' \
+      | tr '\n' ' ')
+    if [[ -n "${code_roots// /}" ]]; then
+      # Build a parent→children map once, then walk it.
+      ps -eo pid,ppid,rss,comm \
+        | awk -v roots="$code_roots" '
+            BEGIN { n=split(roots, r, " "); for (i=1;i<=n;i++) if (r[i]!="") is_root[r[i]]=1 }
+            NR>1 {
+              pid=$1; ppid=$2; rss=$3;
+              comm=""; for (i=4;i<=NF;i++) comm=comm" "$i;
+              parent[pid]=ppid; rss_of[pid]=rss; comm_of[pid]=comm;
+              children[ppid] = children[ppid] " " pid;
+            }
+            END {
+              # Print each root and its descendants.
+              for (rp in is_root) {
+                # Skip if this root is itself a child of another root (avoid dupes).
+                if (parent[rp] in is_root) continue;
+                walk(rp, 0);
+              }
+            }
+            function walk(pid, depth,   i, n, kids, k) {
+              indent = "";
+              for (i=0; i<depth; i++) indent = indent "  ";
+              printf "%s%-6s %8.1f MB %s\n", indent, pid, rss_of[pid]/1024, comm_of[pid];
+              n = split(children[pid], kids, " ");
+              for (k=1; k<=n; k++) if (kids[k] != "") walk(kids[k], depth+1);
+            }
+          '
     else
-      printf "(pstree not installed — brew install pstree)\n"
+      printf "(no Code processes found)\n"
     fi
 
     # ╭──────────────────────────────────────────────╮
