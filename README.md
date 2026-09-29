@@ -81,8 +81,7 @@ Every 5 minutes (configurable via `INTERVAL_SECS` in the script):
 5. **Shell / terminal children under Code** — catches integrated-terminal
    subprocesses (`pi`, long-running `node`, etc.).
 6. **`code --status`** — VS Code's built-in per-process + workspace stats.
-7. **Process tree** — custom tree built from `ps` (not `pstree`, which is
-   blocked by Santa at Shopify) showing Code descendants with RSS at each
+7. **Process tree** — custom tree built from `ps` showing Code descendants with RSS at each
    level.
 8. **FD counts** for top RSS processes — spots FD leaks, which often
    accompany memory leaks.
